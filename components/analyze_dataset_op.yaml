@@ -1,0 +1,55 @@
+name: Analyze dataset op
+description: Component to generate statistics from the dataset.
+inputs:
+- {name: parquet_dataset, type: Dataset}
+- {name: n_workers, type: Integer}
+- {name: device_limit_frac, type: Float, default: '0.8', optional: true}
+- {name: device_pool_frac, type: Float, default: '0.9', optional: true}
+- {name: part_mem_frac, type: Float, default: '0.125', optional: true}
+outputs:
+- {name: workflow, type: Artifact}
+implementation:
+  container:
+    image: nvcr.io/nvidia/merlin/merlin-training:21.09
+    command:
+    - sh
+    - -ec
+    - |
+      program_path=$(mktemp -d)
+      printf "%s" "$0" > "$program_path/ephemeral_component.py"
+      python3 -m kfp.v2.components.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+    - "\nimport kfp\nfrom kfp.v2 import dsl\nfrom kfp.v2.dsl import *\nfrom typing\
+      \ import *\n\ndef analyze_dataset_op(\n    parquet_dataset: Input[Dataset],\n\
+      \    workflow: Output[Artifact],\n    n_workers: int,\n    device_limit_frac:\
+      \ Optional[float] = 0.8,\n    device_pool_frac: Optional[float] = 0.9,\n   \
+      \ part_mem_frac: Optional[float] = 0.125\n):\n    '''\n    Component to generate\
+      \ statistics from the dataset.\n\n    parquet_dataset: Input[Dataset]\n    \
+      \    Input metadata with references to the train and valid converted\n     \
+      \   datasets in GCS and the split name.\n        Usage:\n            parquet_dataset.path\n\
+      \            parquet_dataset.metadata['split']\n    workflow: Output[Artifact]\n\
+      \        Output metadata with the path to the fitted workflow artifacts\n  \
+      \      (statistics).\n    n_workers: int\n        Number of GPUs allocated to\
+      \ do the fitting process\n    shuffle: str\n        How to shuffle the transformed\
+      \ data, default to None.\n        Options:\n            PER_PARTITION\n    \
+      \        PER_WORKER\n            FULL\n    '''\n    from preprocessing import\
+      \ etl\n    import logging\n    import os\n\n    logging.basicConfig(level=logging.INFO)\n\
+      \n    split = parquet_dataset.metadata['split']\n\n    # Create Dask cluster\n\
+      \    logging.info('Creating Dask cluster.')\n    client = etl.create_cluster(\n\
+      \        n_workers = n_workers,\n        device_limit_frac = device_limit_frac,\
+      \ \n        device_pool_frac = device_pool_frac\n    )\n\n    # Create data\
+      \ transformation workflow. This step will only \n    # calculate statistics\
+      \ based on the transformations\n    logging.info('Creating transformation workflow.')\n\
+      \    criteo_workflow = etl.create_criteo_nvt_workflow(client=client)\n\n   \
+      \ # Create dataset to be fitted\n    logging.info(f'Creating dataset to be analysed.')\n\
+      \    logging.info(f'Base path in {parquet_dataset.path}')\n    dataset = etl.create_parquet_dataset(\n\
+      \        client=client,\n        data_path=os.path.join(\n            parquet_dataset.path.replace('/gcs/','gs://'),\n\
+      \            split\n        ),\n        part_mem_frac=part_mem_frac\n    )\n\
+      \n    logging.info(f'Starting workflow fitting for {split} split.')\n    criteo_workflow\
+      \ = etl.analyze_dataset(criteo_workflow, dataset)\n    logging.info('Finished\
+      \ generating statistics for dataset.')\n\n    etl.save_workflow(criteo_workflow,\
+      \ workflow.path)\n    logging.info('Workflow saved to GCS')\n\n"
+    args:
+    - --executor_input
+    - {executorInput: null}
+    - --function_to_execute
+    - analyze_dataset_op

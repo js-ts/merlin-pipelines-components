@@ -1,0 +1,69 @@
+name: Convert csv to parquet op
+description: Component to convert CSV file(s) to Parquet format using NVTabular.
+inputs:
+- {name: data_paths, type: JsonArray}
+- {name: split, type: String}
+- {name: sep, type: String}
+- {name: num_output_files, type: Integer}
+- {name: n_workers, type: Integer}
+- {name: shuffle, type: String, optional: true}
+- name: recursive
+  type: Boolean
+  default: "False"
+  optional: true
+- {name: device_limit_frac, type: Float, default: '0.8', optional: true}
+- {name: device_pool_frac, type: Float, default: '0.9', optional: true}
+- {name: part_mem_frac, type: Float, default: '0.125', optional: true}
+outputs:
+- {name: output_dataset, type: Dataset}
+implementation:
+  container:
+    image: nvcr.io/nvidia/merlin/merlin-training:21.09
+    command:
+    - sh
+    - -ec
+    - |
+      program_path=$(mktemp -d)
+      printf "%s" "$0" > "$program_path/ephemeral_component.py"
+      python3 -m kfp.v2.components.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+    - "\nimport kfp\nfrom kfp.v2 import dsl\nfrom kfp.v2.dsl import *\nfrom typing\
+      \ import *\n\ndef convert_csv_to_parquet_op(\n    output_dataset: Output[Dataset],\n\
+      \    data_paths: list,\n    split: str,\n    sep: str,\n    num_output_files:\
+      \ int,\n    n_workers: int,\n    shuffle: Optional[str] = None,\n    recursive:\
+      \ Optional[bool] = False,\n    device_limit_frac: Optional[float] = 0.8,\n \
+      \   device_pool_frac: Optional[float] = 0.9,\n    part_mem_frac: Optional[float]\
+      \ = 0.125\n):\n    '''\n    Component to convert CSV file(s) to Parquet format\
+      \ using NVTabular.\n\n    output_dataset: Output[Dataset]\n        Output metadata\
+      \ with references to the converted CSV files in GCS\n        and the split name.\n\
+      \        The path to the files are in GCS fuse format:\n            /gcs/<bucket\
+      \ name>/path/to/file\n        Usage:\n            output_dataset.path\n    \
+      \        output_dataset.metadata['split']\n    data_paths: list\n        List\
+      \ of paths to folders or files on GCS.\n        For recursive folder search,\
+      \ set the recursive variable to True\n        Format:\n            'gs://<bucket_name>/<subfolder1>/<subfolder>/'\
+      \ or\n            'gs://<bucket_name>/<subfolder1>/<subfolder>/flat_file.csv'\
+      \ or\n            a combination of both.\n    split: str\n        Split name\
+      \ of the dataset. Example: train or valid\n    n_workers: int\n        Number\
+      \ of GPUs allocated to convert the CSV to Parquet\n    shuffle: str\n      \
+      \  How to shuffle the converted CSV, default to None.\n        Options:\n  \
+      \          PER_PARTITION\n            PER_WORKER\n            FULL\n    recursive:\
+      \ bool\n        Recursivelly search for files in path.\n    '''\n\n    import\
+      \ logging\n    import os\n    from preprocessing import etl\n    import feature_utils\n\
+      \n    logging.basicConfig(level=logging.INFO)\n\n    logging.info('Getting column\
+      \ names and dtypes')\n    col_dtypes = feature_utils.get_criteo_col_dtypes()\n\
+      \n    # Create Dask cluster\n    logging.info('Creating Dask cluster.')\n  \
+      \  client = etl.create_cluster(\n        n_workers = n_workers,\n        device_limit_frac\
+      \ = device_limit_frac,\n        device_pool_frac = device_pool_frac\n    )\n\
+      \n    logging.info(f'Creating {split} dataset.')\n    dataset = etl.create_csv_dataset(\n\
+      \        data_paths=data_paths,\n        sep=sep,\n        recursive=recursive,\
+      \ \n        col_dtypes=col_dtypes,\n        part_mem_frac=part_mem_frac, \n\
+      \        client=client\n    )\n\n    logging.info(f'Base path in {output_dataset.path}')\n\
+      \    fuse_output_dir = os.path.join(output_dataset.path, split)\n\n    logging.info(f'Writing\
+      \ parquet file(s) to {fuse_output_dir}')\n    etl.convert_csv_to_parquet(\n\
+      \        output_path=fuse_output_dir,\n        dataset=dataset, \n        output_files=num_output_files,\
+      \ \n        shuffle=shuffle\n    )\n\n    # Write metadata\n    output_dataset.metadata['split']\
+      \ = split\n\n"
+    args:
+    - --executor_input
+    - {executorInput: null}
+    - --function_to_execute
+    - convert_csv_to_parquet_op
