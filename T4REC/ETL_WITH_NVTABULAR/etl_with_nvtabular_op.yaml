@@ -1,0 +1,119 @@
+name: Etl with nvtabular op
+inputs:
+- {name: cat_feat_list, type: JsonArray, default: '["user_session", "category_code",
+    "brand", "user_id", "product_id", "category_id", "event_type"]', optional: true}
+- {name: Data_Input, type: String, default: /dli/task/data/, optional: true}
+- {name: session_feat_list, type: JsonArray, default: '["event_time_ts"]', optional: true}
+outputs:
+- {name: output_path, type: String}
+implementation:
+  container:
+    image: nvcr.io/nvidia/merlin/merlin-inference:21.11
+    command:
+    - sh
+    - -ec
+    - |
+      program_path=$(mktemp -d)
+      printf "%s" "$0" > "$program_path/ephemeral_component.py"
+      python3 -m kfp.v2.components.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+    - "\nimport kfp\nfrom kfp.v2 import dsl\nfrom kfp.v2.dsl import *\nfrom typing\
+      \ import *\n\ndef etl_with_nvtabular_op(\n# - Categorify categorical features\
+      \ with `Categorify()` op\n    cat_feat_list: list = ['user_session', 'category_code',\
+      \ 'brand', 'user_id', 'product_id', 'category_id', 'event_type'],\n    Data_Input:\
+      \ str=\"/dli/task/data/\",\n    session_feat_list: list=['event_time_ts']\n\
+      )->NamedTuple('Output',[('output_path',str)]):\n    # Import Libraries\n   \
+      \ import os\n    import numpy as np \n    import cupy as cp\n    import glob\n\
+      \    import cudf\n    import nvtabular as nvt\n    from nvtabular import ColumnSelector\n\
+      \    from nvtabular.ops import Operator\n    from numba import config      \
+      \  \n    from preprocessing import etl\n    import feature_utils\n    from transformers4rec.data.preprocessing\
+      \ import save_time_based_splits\n\n    # Set up Input and Output Data Paths\n\
+      \    INPUT_DATA_DIR = os.environ.get(\"INPUT_DATA_DIR\",Data_Input)\n    # os.environ.get(\"\
+      INPUT_DATA_DIR\", \"/dli/task/data/\")\n    # Read the Input Parquet file\n\
+      \    df = cudf.read_parquet(os.path.join(INPUT_DATA_DIR, 'Oct-2019.parquet'))\
+      \  \n\n\n    # categorify features ['user_session', 'category_code', 'brand',\
+      \ 'user_id', 'product_id', 'category_id', 'event_type']\n    # Initialize NVTabular\
+      \ Workflow\n\n    # Categorical Features Encoding\n    cat_feats = cat_feat_list\
+      \ >> nvt.ops.Categorify(start_index=1)\n\n\n\n    # Create temporal features\
+      \ with a `user-defined custom` op and `Lambda` op\n\n\n        # create time\
+      \ features\n        # Extract Temporal Features\n    session_ts = session_feat_list\n\
+      \    session_time = (\n        session_ts >> \n        nvt.ops.LambdaOp(lambda\
+      \ col: cudf.to_datetime(col, unit='s')) >> \n        nvt.ops.Rename(name = 'event_time_dt')\n\
+      \    )\n\n    sessiontime_weekday = (\n        session_time >> \n        nvt.ops.LambdaOp(lambda\
+      \ col: col.dt.weekday) >> \n        nvt.ops.Rename(name ='et_dayofweek')\n \
+      \   )\n\n    def get_cycled_feature_value_sin(col, max_value):\n        value_scaled\
+      \ = (col + 0.000001) / max_value\n        value_sin = np.sin(2*np.pi*value_scaled)\n\
+      \        return value_sin\n\n    def get_cycled_feature_value_cos(col, max_value):\n\
+      \        value_scaled = (col + 0.000001) / max_value\n        value_cos = np.cos(2*np.pi*value_scaled)\n\
+      \        return value_cos\n\n    weekday_sin = sessiontime_weekday >> (lambda\
+      \ col: get_cycled_feature_value_sin(col+1, 7)) >> nvt.ops.Rename(name = 'et_dayofweek_sin')\n\
+      \    weekday_cos= sessiontime_weekday >> (lambda col: get_cycled_feature_value_cos(col+1,\
+      \ 7)) >> nvt.ops.Rename(name = 'et_dayofweek_cos')\n\n    # Add Product Recency\
+      \ feature\n\n    class ItemRecency(Operator):\n        def transform(self, columns,\
+      \ gdf):\n            for column in columns.names:\n                col = gdf[column]\n\
+      \                item_first_timestamp = gdf['prod_first_event_time_ts']\n  \
+      \              delta_days = (col - item_first_timestamp) / (60*60*24)\n    \
+      \            gdf[column + \"_age_days\"] = delta_days * (delta_days >=0)\n \
+      \           return gdf\n\n        def output_column_names(self, columns):\n\
+      \            return ColumnSelector([column + \"_age_days\" for column in columns.names])\n\
+      \n        def dependencies(self):\n            return [\"prod_first_event_time_ts\"\
+      ]\n\n\n    recency_features = ['event_time_ts'] >> ItemRecency() \n    recency_features_norm\
+      \ = recency_features >> nvt.ops.LogOp() >> nvt.ops.Normalize() >> nvt.ops.Rename(name='product_recency_days_log_norm')\n\
+      \n    time_features = (\n        session_time +\n        sessiontime_weekday\
+      \ +\n        weekday_sin +\n        weekday_cos +\n        recency_features_norm\n\
+      \    )\n\n\n    # - Transform continuous features using `Log` and `Normalize`\
+      \ ops\n\n\n        # Smoothing price long-tailed distribution and applying standardization\n\
+      \    price_log = ['price'] >> nvt.ops.LogOp() >> nvt.ops.Normalize() >> nvt.ops.Rename(name='price_log_norm')\n\
+      \    # Normalize Continuous Features\xB6\n    # Relative price to the average\
+      \ price for the category_id\n    def relative_price_to_avg_categ(col, gdf):\n\
+      \        epsilon = 1e-5\n        col = ((gdf['price'] - col) / (col + epsilon))\
+      \ * (col > 0).astype(int)\n        return col\n\n    avg_category_id_pr = ['category_id']\
+      \ >> nvt.ops.JoinGroupby(cont_cols =['price'], stats=[\"mean\"]) >> nvt.ops.Rename(name='avg_category_id_price')\n\
+      \    relative_price_to_avg_category = avg_category_id_pr >> nvt.ops.LambdaOp(relative_price_to_avg_categ,\
+      \ dependency=['price']) >> nvt.ops.Rename(name=\"relative_price_to_avg_categ_id\"\
+      )\n\n\n    # - Group all these features together at the session level sorting\
+      \ the interactions by time with `Groupby`\n\n\n\n    groupby_feats = ['event_time_ts',\
+      \ 'user_session'] + cat_feats + time_features + price_log + relative_price_to_avg_category\n\
+      \n        # Define Groupby Workflow\n    groupby_features = groupby_feats >>\
+      \ nvt.ops.Groupby(\n        groupby_cols=[\"user_session\"], \n        sort_cols=[\"\
+      event_time_ts\"],\n        aggs={\n            'user_id': ['first'],\n     \
+      \       'product_id': [\"list\", \"count\"],\n            'category_code': [\"\
+      list\"],  \n            'event_type': [\"list\"], \n            'brand': [\"\
+      list\"], \n            'category_id': [\"list\"], \n            'event_time_ts':\
+      \ [\"first\"],\n            'event_time_dt': [\"first\"],\n            'et_dayofweek_sin':\
+      \ [\"list\"],\n            'et_dayofweek_cos': [\"list\"],\n            'price_log_norm':\
+      \ [\"list\"],\n            'relative_price_to_avg_categ_id': [\"list\"],\n \
+      \           'product_recency_days_log_norm': [\"list\"]\n            },\n  \
+      \      name_sep=\"-\")\n\n    groupby_features_list = groupby_features['product_id-list',\n\
+      \        'category_code-list',  \n        'event_type-list', \n        'brand-list',\
+      \ \n        'category_id-list', \n        'et_dayofweek_sin-list',\n       \
+      \ 'et_dayofweek_cos-list',\n        'price_log_norm-list',\n        'relative_price_to_avg_categ_id-list',\n\
+      \        'product_recency_days_log_norm-list']\n\n\n    SESSIONS_MAX_LENGTH\
+      \ = 20 \n    MINIMUM_SESSION_LENGTH = 2\n    # Grouping interactions into sessions\n\
+      \    # Aggregate by session id and creates the sequential features\n    groupby_features_trim\
+      \ = groupby_features_list >> nvt.ops.ListSlice(0,SESSIONS_MAX_LENGTH) >> nvt.ops.Rename(postfix\
+      \ = '_seq')\n\n    # calculate session day index based on 'timestamp-first'\
+      \ column\n    day_index = ((groupby_features['event_time_dt-first'])  >> \n\
+      \        nvt.ops.LambdaOp(lambda col: (col - col.min()).dt.days +1) >> \n  \
+      \      nvt.ops.Rename(f = lambda col: \"day_index\")\n    )\n\n    selected_features\
+      \ = groupby_features['user_session', 'product_id-count'] + groupby_features_trim\
+      \ + day_index\n\n    filtered_sessions = selected_features >> nvt.ops.Filter(f=lambda\
+      \ df: df[\"product_id-count\"] >= MINIMUM_SESSION_LENGTH)\n\n    # avoid numba\
+      \ warnings\n\n    config.CUDA_LOW_OCCUPANCY_WARNINGS = 0\n\n    dataset = nvt.Dataset(df)\n\
+      \    workflow = nvt.Workflow(filtered_sessions)\n    workflow.fit(dataset)\n\
+      \    sessions_gdf = workflow.transform(dataset).to_ddf()\n\n    workflow_path\
+      \ = os.path.join(INPUT_DATA_DIR, 'workflow_etl')\n    workflow.save(workflow_path)\n\
+      \n\n\n\n\n        # define partition column\n    PARTITION_COL = 'day_index'\n\
+      \    # make changes here use gcs upload component\n    # define output_folder\
+      \ to store the partitioned parquet files\n    OUTPUT_FOLDER = os.environ.get(\"\
+      OUTPUT_FOLDER\", INPUT_DATA_DIR + \"sessions_by_day\")\n    import subprocess\n\
+      \    subprocess.run([\"mkdir\", \"-p\",OUTPUT_FOLDER])\n\n    save_time_based_splits(data=nvt.Dataset(sessions_gdf),\n\
+      \                       output_dir= OUTPUT_FOLDER,\n                       partition_col=PARTITION_COL,\n\
+      \                       timestamp_col='user_session', \n                   \
+      \   )\n    #implement named tuple\n    from collections import namedtuple\n\
+      \    upload_file_path = namedtuple('Output',['OutputPath_Name'])\n    return\
+      \ upload_file_path(OUTPUT_FOLDER)\n\n"
+    args:
+    - --executor_input
+    - {executorInput: null}
+    - --function_to_execute
+    - etl_with_nvtabular_op
